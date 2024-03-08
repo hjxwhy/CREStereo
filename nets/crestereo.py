@@ -1,6 +1,6 @@
-import megengine.module as M
-import megengine.functional as F
-from megengine import amp
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from .update import BasicUpdateBlock
 from .extractor import BasicEncoder
@@ -8,8 +8,19 @@ from .corr import AGCL
 
 from .attention import PositionEncodingSine, LocalFeatureTransformer
 
+try:
+    autocast = torch.cuda.amp.autocast
+except:
+    # dummy autocast for PyTorch < 1.6
+    class autocast:
+        def __init__(self, enabled):
+            pass
+        def __enter__(self):
+            pass
+        def __exit__(self, *args):
+            pass
 
-class CREStereo(M.Module):
+class CREStereo(nn.Module):
     def __init__(self, max_disp=192, mixed_precision=False, test_mode=False):
         super(CREStereo, self).__init__()
 
@@ -39,10 +50,10 @@ class CREStereo(M.Module):
 
         # adaptive search
         self.search_num = 9
-        self.conv_offset_16 = M.Conv2d(
+        self.conv_offset_16 = nn.Conv2d(
             256, self.search_num * 2, kernel_size=3, stride=1, padding=1
         )
-        self.conv_offset_8 = M.Conv2d(
+        self.conv_offset_8 = nn.Conv2d(
             256, self.search_num * 2, kernel_size=3, stride=1, padding=1
         )
         self.range_16 = 1
@@ -50,47 +61,28 @@ class CREStereo(M.Module):
 
     def freeze_bn(self):
         for m in self.modules():
-            if isinstance(m, M.BatchNorm2d):
+            if isinstance(m, nn.BatchNorm2d):
                 m.eval()
 
-    def unfold(self, x, kernel_size, dilation=1, padding=0, stride=1):
-        n, c, h, w = x.shape
-        if isinstance(kernel_size, tuple) or isinstance(kernel_size, list):
-            assert len(kernel_size) == 2
-            k1, k2 = kernel_size
-        else:
-            assert isinstance(kernel_size, int)
-            k1 = k2 = kernel_size
-        x = F.sliding_window(
-            x,
-            kernel_size=kernel_size,
-            dilation=dilation,
-            padding=padding,
-            stride=stride,
-        )
-        x = F.reshape(x, (n, c, -1, k1 * k2))
-        x = F.transpose(x, (0, 1, 3, 2))
-        x = F.reshape(x, (n, c * k1 * k2, -1))
-        return x
-
     def convex_upsample(self, flow, mask, rate=4):
-        """[H/rate, W/rate, 2] -> [H, W, 2]"""
+        """ Upsample flow field [H/8, W/8, 2] -> [H, W, 2] using convex combination """
         N, _, H, W = flow.shape
-        mask = F.reshape(mask, (N, 1, 9, rate, rate, H, W))
-        mask = F.softmax(mask, axis=2)
+        # print(flow.shape, mask.shape, rate)
+        mask = mask.view(N, 1, 9, rate, rate, H, W)
+        mask = torch.softmax(mask, dim=2)
 
-        up_flow = self.unfold(rate * flow, [3, 3], padding=1)
-        up_flow = F.reshape(up_flow, (N, 2, 9, 1, 1, H, W))
+        up_flow = F.unfold(rate * flow, [3,3], padding=1)
+        up_flow = up_flow.view(N, 2, 9, 1, 1, H, W)
 
-        up_flow = F.sum(mask * up_flow, axis=2)
-        up_flow = F.transpose(up_flow, (0, 1, 4, 2, 5, 3))
-        return F.reshape(up_flow, (N, 2, rate * H, rate * W))
+        up_flow = torch.sum(mask * up_flow, dim=2)
+        up_flow = up_flow.permute(0, 1, 4, 2, 5, 3)
+        return up_flow.reshape(N, 2, rate*H, rate*W)
 
     def zero_init(self, fmap):
         N, C, H, W = fmap.shape
-        _x = F.zeros([N, 1, H, W], dtype="float32")
-        _y = F.zeros([N, 1, H, W], dtype="float32")
-        zero_flow = F.concat([_x, _y], axis=1).to(fmap.device)
+        _x = torch.zeros([N, 1, H, W], dtype="float32")
+        _y = torch.zeros([N, 1, H, W], dtype="float32")
+        zero_flow = torch.cat([_x, _y], dim=1).to(fmap.device)
         return zero_flow
 
     def forward(self, image1, image2, iters=10, flow_init=None):
@@ -102,13 +94,13 @@ class CREStereo(M.Module):
         cdim = self.context_dim
 
         # feature network
-        with amp.autocast(enabled=self.mixed_precision):
+        with autocast(enabled=self.mixed_precision):
             fmap1, fmap2 = self.fnet([image1, image2])
 
         fmap1 = fmap1.astype("float32")
         fmap2 = fmap2.astype("float32")
 
-        with amp.autocast(enabled=self.mixed_precision):
+        with autocast(enabled=self.mixed_precision):
 
             # 1/4 -> 1/8
             # feature
@@ -120,7 +112,7 @@ class CREStereo(M.Module):
             offset_dw8 = self.range_8 * (F.sigmoid(offset_dw8) - 0.5) * 2.0
 
             # context
-            net, inp = F.split(fmap1, [hdim], axis=1)
+            net, inp = torch.split(fmap1, [hdim,hdim], dim=1)
             net = F.tanh(net)
             inp = F.relu(inp)
             net_dw8 = F.avg_pool2d(net, 2, stride=2)
@@ -143,23 +135,14 @@ class CREStereo(M.Module):
             )
             # 'n c h w -> n (h w) c'
             x_tmp = pos_encoding_fn_small(fmap1_dw16)
-            fmap1_dw16 = F.reshape(
-                F.transpose(x_tmp, (0, 2, 3, 1)),
-                (x_tmp.shape[0], x_tmp.shape[2] * x_tmp.shape[3], x_tmp.shape[1]),
-            )
+            fmap1_dw16 = x_tmp.permute(0, 2, 3, 1).reshape(x_tmp.shape[0], x_tmp.shape[2] * x_tmp.shape[3], x_tmp.shape[1])
             # 'n c h w -> n (h w) c'
             x_tmp = pos_encoding_fn_small(fmap2_dw16)
-            fmap2_dw16 = F.reshape(
-                F.transpose(x_tmp, (0, 2, 3, 1)),
-                (x_tmp.shape[0], x_tmp.shape[2] * x_tmp.shape[3], x_tmp.shape[1]),
-            )
+            fmap2_dw16 = x_tmp.permute(0, 2, 3, 1).reshape(x_tmp.shape[0], x_tmp.shape[2] * x_tmp.shape[3], x_tmp.shape[1])
 
             fmap1_dw16, fmap2_dw16 = self.self_att_fn(fmap1_dw16, fmap2_dw16)
             fmap1_dw16, fmap2_dw16 = [
-                F.transpose(
-                    F.reshape(x, (x.shape[0], image1.shape[2] // 16, -1, x.shape[2])),
-                    (0, 3, 1, 2),
-                )
+                x.reshape(x.shape[0], image1.shape[2] // 16, -1, x.shape[2]).permute(0, 3, 1, 2)
                 for x in [fmap1_dw16, fmap2_dw16]
             ]
 
@@ -173,7 +156,7 @@ class CREStereo(M.Module):
         flow_up = None
         if flow_init is not None:
             scale = fmap1.shape[2] / flow_init.shape[2]
-            flow = -scale * F.nn.interpolate(
+            flow = -scale * F.interpolate(
                 flow_init,
                 size=(fmap1.shape[2], fmap1.shape[3]),
                 mode="bilinear",
@@ -196,14 +179,14 @@ class CREStereo(M.Module):
                     flow_dw16, offset_dw16, small_patch=small_patch
                 )
 
-                with amp.autocast(enabled=self.mixed_precision):
+                with autocast(enabled=self.mixed_precision):
                     net_dw16, up_mask, delta_flow = self.update_block(
                         net_dw16, inp_dw16, out_corrs, flow_dw16
                     )
 
                 flow_dw16 = flow_dw16 + delta_flow
                 flow = self.convex_upsample(flow_dw16, up_mask, rate=4)
-                flow_up = -4 * F.nn.interpolate(
+                flow_up = -4 * F.interpolate(
                     flow,
                     size=(4 * flow.shape[2], 4 * flow.shape[3]),
                     mode="bilinear",
@@ -212,7 +195,7 @@ class CREStereo(M.Module):
                 predictions.append(flow_up)
 
             scale = fmap1_dw8.shape[2] / flow.shape[2]
-            flow_dw8 = -scale * F.nn.interpolate(
+            flow_dw8 = -scale * F.interpolate(
                 flow,
                 size=(fmap1_dw8.shape[2], fmap1_dw8.shape[3]),
                 mode="bilinear",
@@ -229,14 +212,14 @@ class CREStereo(M.Module):
                 flow_dw8 = flow_dw8.detach()
                 out_corrs = corr_fn_dw8(flow_dw8, offset_dw8, small_patch=small_patch)
 
-                with amp.autocast(enabled=self.mixed_precision):
+                with autocast(enabled=self.mixed_precision):
                     net_dw8, up_mask, delta_flow = self.update_block(
                         net_dw8, inp_dw8, out_corrs, flow_dw8
                     )
 
                 flow_dw8 = flow_dw8 + delta_flow
                 flow = self.convex_upsample(flow_dw8, up_mask, rate=4)
-                flow_up = -2 * F.nn.interpolate(
+                flow_up = -2 * F.interpolate(
                     flow,
                     size=(2 * flow.shape[2], 2 * flow.shape[3]),
                     mode="bilinear",
@@ -245,7 +228,7 @@ class CREStereo(M.Module):
                 predictions.append(flow_up)
 
             scale = fmap1.shape[2] / flow.shape[2]
-            flow = -scale * F.nn.interpolate(
+            flow = -scale * F.interpolate(
                 flow,
                 size=(fmap1.shape[2], fmap1.shape[3]),
                 mode="bilinear",
@@ -262,7 +245,7 @@ class CREStereo(M.Module):
             flow = flow.detach()
             out_corrs = corr_fn(flow, None, small_patch=small_patch, iter_mode=True)
 
-            with amp.autocast(enabled=self.mixed_precision):
+            with autocast(enabled=self.mixed_precision):
                 net, up_mask, delta_flow = self.update_block(net, inp, out_corrs, flow)
 
             flow = flow + delta_flow

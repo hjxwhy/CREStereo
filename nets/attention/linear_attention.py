@@ -3,27 +3,22 @@ Linear Transformer proposed in "Transformers are RNNs: Fast Autoregressive Trans
 Modified from: https://github.com/idiap/fast-transformers/blob/master/fast_transformers/attention/linear_attention.py
 """
 
-import numpy as np
-import megengine.module as M
-import megengine.functional as F
-
-
-def elu(x, alpha=1.0):
-    return F.maximum(0, x) + F.minimum(0, alpha * (F.exp(x) - 1))
+import torch
+from torch.nn import Module, Dropout
 
 
 def elu_feature_map(x):
-    return elu(x) + 1
+    return torch.nn.functional.elu(x) + 1
 
 
-class LinearAttention(M.Module):
+class LinearAttention(Module):
     def __init__(self, eps=1e-6):
         super().__init__()
         self.feature_map = elu_feature_map
         self.eps = eps
 
     def forward(self, queries, keys, values, q_mask=None, kv_mask=None):
-        """Multi-Head linear attention proposed in "Transformers are RNNs"
+        """ Multi-Head linear attention proposed in "Transformers are RNNs"
         Args:
             queries: [N, L, H, D]
             keys: [N, S, H, D]
@@ -38,34 +33,28 @@ class LinearAttention(M.Module):
 
         # set padded position to zero
         if q_mask is not None:
-            Q = Q * F.expand_dims(q_mask, (2, 3))  # [:, :, None, None]
+            Q = Q * q_mask[:, :, None, None]
         if kv_mask is not None:
-            K = K * F.expand_dims(kv_mask, (2, 3))  # [:, :, None, None]
-            values = values * F.expand_dims(kv_mask, (2, 3))  # [:, :, None, None]
+            K = K * kv_mask[:, :, None, None]
+            values = values * kv_mask[:, :, None, None]
 
-        v_length = values.shape[1]
+        v_length = values.size(1)
         values = values / v_length  # prevent fp16 overflow
-        KV = F.sum(F.expand_dims(K, -1) * F.expand_dims(values, 3), axis=1)
-        Z = 1 / (F.sum(Q * F.sum(K, axis=1, keepdims=True), axis=-1) + self.eps)
-        queried_values = (
-            F.sum(
-                F.expand_dims(Q, -1) * F.expand_dims(KV, 1) * F.expand_dims(Z, (3, 4)),
-                axis=3,
-            )
-            * v_length
-        )
+        KV = torch.einsum("nshd,nshv->nhdv", K, values)  # (S,D)' @ S,V
+        Z = 1 / (torch.einsum("nlhd,nhd->nlh", Q, K.sum(dim=1)) + self.eps)
+        queried_values = torch.einsum("nlhd,nhdv,nlh->nlhv", Q, KV, Z) * v_length
 
-        return queried_values
+        return queried_values.contiguous()
 
 
-class FullAttention(M.Module):
+class FullAttention(Module):
     def __init__(self, use_dropout=False, attention_dropout=0.1):
         super().__init__()
         self.use_dropout = use_dropout
-        self.dropout = M.Dropout(drop_prob=attention_dropout)
+        self.dropout = Dropout(attention_dropout)
 
     def forward(self, queries, keys, values, q_mask=None, kv_mask=None):
-        """Multi-head scaled dot-product attention, a.k.a full attention.
+        """ Multi-head scaled dot-product attention, a.k.a full attention.
         Args:
             queries: [N, L, H, D]
             keys: [N, S, H, D]
@@ -77,20 +66,16 @@ class FullAttention(M.Module):
         """
 
         # Compute the unnormalized attention and apply the masks
-        QK = F.sum(F.expand_dims(queries, 2) * F.expand_dims(keys, 1), axis=-1)
+        QK = torch.einsum("nlhd,nshd->nlsh", queries, keys)
         if kv_mask is not None:
-            assert q_mask.dtype == np.bool_
-            assert kv_mask.dtype == np.bool_
-            QK[
-                ~(F.expand_dims(q_mask, (2, 3)) & F.expand_dims(kv_mask, (1, 3)))
-            ] = float("-inf")
+            QK.masked_fill_(~(q_mask[:, :, None, None] * kv_mask[:, None, :, None]), float('-inf'))
 
         # Compute the attention and the weighted average
-        softmax_temp = 1.0 / queries.shape[3] ** 0.5  # sqrt(D)
-        A = F.softmax(softmax_temp * QK, axis=2)
+        softmax_temp = 1. / queries.size(3)**.5  # sqrt(D)
+        A = torch.softmax(softmax_temp * QK, dim=2)
         if self.use_dropout:
             A = self.dropout(A)
 
-        queried_values = F.sum(F.expand_dims(A, -1) * F.expand_dims(values, 1), axis=2)
+        queried_values = torch.einsum("nlsh,nshd->nlhd", A, values)
 
-        return queried_values
+        return queried_values.contiguous()
