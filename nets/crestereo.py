@@ -80,8 +80,8 @@ class CREStereo(nn.Module):
 
     def zero_init(self, fmap):
         N, C, H, W = fmap.shape
-        _x = torch.zeros([N, 1, H, W], dtype="float32")
-        _y = torch.zeros([N, 1, H, W], dtype="float32")
+        _x = torch.zeros((N, 1, H, W), dtype=fmap.dtype)
+        _y = torch.zeros((N, 1, H, W), dtype=fmap.dtype)
         zero_flow = torch.cat([_x, _y], dim=1).to(fmap.device)
         return zero_flow
 
@@ -96,9 +96,6 @@ class CREStereo(nn.Module):
         # feature network
         with autocast(enabled=self.mixed_precision):
             fmap1, fmap2 = self.fnet([image1, image2])
-
-        fmap1 = fmap1.astype("float32")
-        fmap2 = fmap2.astype("float32")
 
         with autocast(enabled=self.mixed_precision):
 

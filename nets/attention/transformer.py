@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from .linear_attention import LinearAttention, FullAttention
 
-
+#Ref: https://github.com/zju3dv/LoFTR/blob/master/src/loftr/loftr_module/transformer.py
 class LoFTREncoderLayer(nn.Module):
     def __init__(self,
                  d_model,
@@ -24,7 +24,7 @@ class LoFTREncoderLayer(nn.Module):
         # feed-forward network
         self.mlp = nn.Sequential(
             nn.Linear(d_model*2, d_model*2, bias=False),
-            nn.ReLU(True),
+            nn.ReLU(),
             nn.Linear(d_model*2, d_model, bias=False),
         )
 
@@ -61,14 +61,13 @@ class LoFTREncoderLayer(nn.Module):
 class LocalFeatureTransformer(nn.Module):
     """A Local Feature Transformer (LoFTR) module."""
 
-    def __init__(self, config):
+    def __init__(self, d_model, nhead, layer_names, attention):
         super(LocalFeatureTransformer, self).__init__()
 
-        self.config = config
-        self.d_model = config['d_model']
-        self.nhead = config['nhead']
-        self.layer_names = config['layer_names']
-        encoder_layer = LoFTREncoderLayer(config['d_model'], config['nhead'], config['attention'])
+        self.d_model = d_model
+        self.nhead = nhead
+        self.layer_names = layer_names
+        encoder_layer = LoFTREncoderLayer(d_model, nhead, attention)
         self.layers = nn.ModuleList([copy.deepcopy(encoder_layer) for _ in range(len(self.layer_names))])
         self._reset_parameters()
 
@@ -85,10 +84,10 @@ class LocalFeatureTransformer(nn.Module):
             mask0 (torch.Tensor): [N, L] (optional)
             mask1 (torch.Tensor): [N, S] (optional)
         """
-
         assert self.d_model == feat0.size(2), "the feature number of src and transformer must be equal"
 
         for layer, name in zip(self.layers, self.layer_names):
+
             if name == 'self':
                 feat0 = layer(feat0, feat0, mask0, mask0)
                 feat1 = layer(feat1, feat1, mask1, mask1)

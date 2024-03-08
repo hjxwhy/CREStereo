@@ -22,7 +22,6 @@ class AGCL:
 
     def __call__(self, flow, extra_offset, small_patch=False, iter_mode=False):
         if iter_mode:
-            raise RuntimeError
             corr = self.corr_iter(self.fmap1, self.fmap2, flow, small_patch)
         else:
             corr = self.corr_att_offset(
@@ -37,23 +36,24 @@ class AGCL:
         di_y, di_x = dilate[0], dilate[1]
         pady, padx = psize[0] // 2 * di_y, psize[1] // 2 * di_x
 
-        right_pad = F.pad(right_feature, pad=(pady, pady, padx, padx), mode="replicate")
+        right_pad = F.pad(right_feature, pad=(padx, padx, pady, pady), mode="replicate")
 
-        right_slid = F.sliding_window(
-            right_pad, kernel_size=(H, W), stride=(di_y, di_x))
-        right_slid = right_slid.reshape(N, C, -1, H, W)
-        right_slid = F.transpose(right_slid, (0, 2, 1, 3, 4))
-        right_slid = right_slid.reshape(-1, C, H, W)
+        corr_list = []
+        for h in range(0, pady * 2 + 1, di_y):
+            for w in range(0, padx * 2 + 1, di_x):
+                right_crop = right_pad[:, :, h : h + H, w : w + W]
+                assert right_crop.shape == left_feature.shape
+                corr = torch.mean(left_feature * right_crop, dim=1, keepdims=True)
+                corr_list.append(corr)
 
-        corr_mean = torch.mean(left_feature * right_slid, axis=1, keepdims=True)
-        corr_final = corr_mean.reshape(1, -1, H, W)
+        corr_final = torch.cat(corr_list, dim=1)
 
         return corr_final
 
     def corr_iter(self, left_feature, right_feature, flow, small_patch):
 
         coords = self.coords + flow
-        coords = F.transpose(coords, (0, 2, 3, 1))
+        coords = coords.permute(0, 2, 3, 1)
         right_feature = bilinear_sampler(right_feature, coords)
 
         if small_patch:
@@ -64,8 +64,8 @@ class AGCL:
             dilate_list = [(1, 1), (1, 1), (1, 1), (1, 1)]
 
         N, C, H, W = left_feature.shape
-        lefts = torch.split(left_feature, left_feature.shape[1]//4, axis=1)
-        rights = torch.split(right_feature, right_feature.shape[1]//4, axis=1)
+        lefts = torch.split(left_feature, left_feature.shape[1]//4, dim=1)
+        rights = torch.split(right_feature, right_feature.shape[1]//4, dim=1)
 
         corrs = []
         for i in range(len(psize_list)):
@@ -85,15 +85,15 @@ class AGCL:
         N, C, H, W = left_feature.shape
 
         if self.att is not None:
-            left_feature = left_feature.transpose(0, 2, 3, 1).reshape(N, H * W, C) # 'n c h w -> n (h w) c'
-            right_feature = right_feature.transpose(0, 2, 3, 1).reshape(N, H * W, C) # 'n c h w -> n (h w) c'
+            left_feature = left_feature.permute(0, 2, 3, 1).reshape(N, H * W, C) # 'n c h w -> n (h w) c'
+            right_feature = right_feature.permute(0, 2, 3, 1).reshape(N, H * W, C) # 'n c h w -> n (h w) c'
             left_feature, right_feature = self.att(left_feature, right_feature)
             # 'n (h w) c -> n c h w'
-            left_feature = left_feature.reshape(N, H, W, C).transpose((0, 3, 1, 2))
-            right_feature = right_feature.reshape(N, H, W, C).transpose((0, 3, 1, 2))
+            left_feature = left_feature.reshape(N, H, W, C).permute((0, 3, 1, 2))
+            right_feature = right_feature.reshape(N, H, W, C).permute((0, 3, 1, 2))
 
-        lefts = torch.split(left_feature, left_feature.shape[1] // 4, axis=1)
-        rights = torch.split(right_feature, left_feature.shape[1] // 4, axis=1)
+        lefts = torch.split(left_feature, left_feature.shape[1] // 4, dim=1)
+        rights = torch.split(right_feature, left_feature.shape[1] // 4, dim=1)
 
         C = C // 4
 
